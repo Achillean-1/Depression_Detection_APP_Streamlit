@@ -1,5 +1,4 @@
 import streamlit as st
-import cv2
 import numpy as np
 import time
 import matplotlib.pyplot as plt
@@ -8,6 +7,95 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.efficientnet import preprocess_input
 import gdown
 import os
+import base64
+from PIL import Image
+import io
+import cv2
+
+def webcam_component():
+    component_html = """
+    <div style="display: flex; flex-direction: column; align-items: center;">
+        <video id="webcam" autoplay playsinline style="width: 640px; height: 480px; border-radius: 10px;"></video>
+        <canvas id="canvas" width="640" height="480" style="display: none;"></canvas>
+        <button id="capture-button" style="
+            background-color: #007bff;
+            color: white;
+            padding: 10px 24px;
+            border-radius: 8px;
+            font-size: 1rem;
+            border: none;
+            cursor: pointer;
+            transition: 0.3s;
+            margin-top: 10px;
+            width: 200px;">
+            Ambil Gambar
+        </button>
+    </div>
+    <script>
+        const video = document.getElementById('webcam');
+        const canvas = document.getElementById('canvas');
+        const captureButton = document.getElementById('capture-button');
+        const ctx = canvas.getContext('2d');
+        let stream = null;
+        let captureInterval = null;
+        let isCapturing = false;
+
+        // Function to initialize webcam
+        async function setupWebcam() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480 },
+                    audio: false
+                });
+                video.srcObject = stream;
+            } catch (err) {
+                console.error("Error accessing webcam:", err);
+                alert("Tidak dapat mengakses kamera. Pastikan browser Anda mengizinkan akses kamera.");
+            }
+        }
+
+        // Function to capture frame
+        function captureFrame() {
+            if (!stream) return null;
+            
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            const imageData = canvas.toDataURL('image/jpeg');
+            
+            // Send to Streamlit
+            window.parent.postMessage({
+                type: 'webcam-frame',
+                data: imageData
+            }, '*');
+        }
+
+        // Setup webcam when the component is loaded
+        setupWebcam();
+
+        // Toggle capturing frames
+        captureButton.addEventListener('click', () => {
+            if (isCapturing) {
+                clearInterval(captureInterval);
+                captureButton.textContent = "Mulai Analisis";
+                isCapturing = false;
+            } else {
+                captureInterval = setInterval(captureFrame, 500); // Capture every 500ms
+                captureButton.textContent = "Akhiri Analisis";
+                isCapturing = true;
+            }
+        });
+
+        // Clean up when component is unmounted
+        window.addEventListener('beforeunload', () => {
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+            }
+            if (captureInterval) {
+                clearInterval(captureInterval);
+            }
+        });
+    </script>
+    """
+    st.components.v1.html(component_html, height=560)
 
 st.markdown("""
 <style>
@@ -110,6 +198,33 @@ def calculate_emotion_scores(predictions):
     
     return negative_score, positive_score
 
+def process_webcam_frame(base64_image):
+    if "," in base64_image:
+        base64_image = base64_image.split(",")[1]
+    
+    image_bytes = base64.b64decode(base64_image)
+    image = Image.open(io.BytesIO(image_bytes))
+    
+    frame_rgb = np.array(image)
+    
+    if model_loaded:
+        pred_idx, pred_prob = predict_expression(frame_rgb, model_effnet)
+        
+        current_time = time.time()
+        elapsed_time = 0
+        if 'start_time' in st.session_state:
+            elapsed_time = current_time - st.session_state.start_time
+        
+        st.session_state.predictions.append(pred_idx)
+        st.session_state.prediction_timestamps.append(elapsed_time)
+        
+        current_expression = categories[pred_idx]
+        current_accuracy = f"{pred_prob[0][pred_idx]*100:.2f}%"
+        
+        return frame_rgb, current_expression, current_accuracy
+    
+    return frame_rgb, "Model not loaded", "0%"
+
 st.markdown("<h1>Analisis Emosi Wajah</h1>", unsafe_allow_html=True)
 
 youtube_placeholder = st.empty()
@@ -138,8 +253,7 @@ if 'predictions' not in st.session_state:
     st.session_state.video_started = False
     st.session_state.analysis_start_time = None
     st.session_state.last_capture_time = 0
-
-FRAME_INTERVAL = 0.5
+    st.session_state.last_frame = None
 
 detection_data = []
 video_container = st.container()
@@ -163,134 +277,45 @@ accuracy_placeholder.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-button_col = st.columns([1, 2, 1])[1]
-with button_col:
-    st.markdown('<div class="custom-button-container">', unsafe_allow_html=True)
-    start_stop_button = st.button(
-        'Mulai Analisis' if not st.session_state.is_analyzing else 'Akhiri Analisis',
-        key='start_stop_analysis_button'
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
-
-if start_stop_button:
-    st.session_state.is_analyzing = not st.session_state.is_analyzing
-    if st.session_state.is_analyzing:
-        st.session_state.predictions = []
-        st.session_state.prediction_timestamps = []
-        detection_data = []
-        st.session_state.start_time = time.time()
-        st.session_state.analysis_start_time = time.time()
-        st.session_state.last_capture_time = 0
-        st.session_state.results_ready = False
-        st.session_state.current_expression = "-"
-        st.session_state.current_accuracy = "-"
-        st.session_state.video_started = False
-    else:
-        st.session_state.results_ready = True
-        st.session_state.current_expression = "-"
-        st.session_state.current_accuracy = "-"
-        youtube_placeholder.markdown("""
-        <div class="youtube-container hidden" id="youtube-container">
-            <div class="youtube-embed">
-                <iframe 
-                    width="640" 
-                    height="360" 
-                    src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=0&mute=1" 
-                    frameborder="0" 
-                    allowfullscreen
-                    id="youtube-iframe">
-                </iframe>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-    st.rerun()
-
-if model_loaded and st.session_state.is_analyzing:
-    video_container = st.container()
-    video_placeholder = video_container.empty()
-    cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    try:
-        while st.session_state.is_analyzing:
-            ret, frame = cap.read()
-            if not ret:
-                st.error("Error: Tidak dapat mengakses kamera")
-                break
-            
-            current_time = time.time()
-            elapsed_time = current_time - st.session_state.start_time
-            
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            video_placeholder.image(frame_rgb, channels="RGB")
-            
-            if not st.session_state.video_started and (current_time - st.session_state.analysis_start_time) >= 10:
-                youtube_placeholder.markdown("""
-                <div class="youtube-container" id="youtube-container">
-                    <div class="youtube-embed">
-                        <iframe 
-                            width="640" 
-                            height="360" 
-                            src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=1&mute=1" 
-                            frameborder="0" 
-                            allowfullscreen
-                            id="youtube-iframe">
-                        </iframe>
-                    </div>
-                </div>
-                <script>
-                    // JavaScript to ensure video starts
-                    document.getElementById('youtube-iframe').src = 
-                        "https://www.youtube.com/embed/3XA0bB79oGc?autoplay=1&mute=1";
-                </script>
-                """, unsafe_allow_html=True)
-                st.session_state.video_started = True
-            
-            if current_time - st.session_state.last_capture_time >= FRAME_INTERVAL:
-                pred_idx, pred_prob = predict_expression(frame_rgb, model_effnet)
-                
-                st.session_state.predictions.append(pred_idx)
-                st.session_state.prediction_timestamps.append(elapsed_time)
-                detection_data.append((elapsed_time, categories[pred_idx]))
-                
-                current_expression = categories[pred_idx]
-                current_accuracy = f"{pred_prob[0][pred_idx]*100:.2f}%"
-                
-                expression_placeholder.markdown(f"""
-                <div class="metric-container">
-                    <div class="metric-label">Ekspresi Terdeteksi</div>
-                    <div class="metric-value" id="expression-value">{current_expression}</div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                accuracy_placeholder.markdown(f"""
-                <div class="metric-container">
-                    <div class="metric-label">Akurasi</div>
-                    <div class="metric-value" id="accuracy-value">{current_accuracy}</div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                st.session_state.last_capture_time = current_time
-            
-            time.sleep(0.1)
-    finally:
-        cap.release()
-        expression_placeholder.markdown("""
+if model_loaded:
+    frame_placeholder = st.empty()
+    
+    webcam_container = st.container()
+    with webcam_container:
+        webcam_component()
+    
+    if 'last_frame' in st.session_state and st.session_state.last_frame is not None:
+        frame_rgb, current_expression, current_accuracy = process_webcam_frame(st.session_state.last_frame)
+        frame_placeholder.image(frame_rgb, channels="RGB")
+        
+        expression_placeholder.markdown(f"""
         <div class="metric-container">
             <div class="metric-label">Ekspresi Terdeteksi</div>
-            <div class="metric-value" id="expression-value">-</div>
+            <div class="metric-value" id="expression-value">{current_expression}</div>
         </div>
         """, unsafe_allow_html=True)
         
-        accuracy_placeholder.markdown("""
+        accuracy_placeholder.markdown(f"""
         <div class="metric-container">
             <div class="metric-label">Akurasi</div>
-            <div class="metric-value" id="accuracy-value">-</div>
+            <div class="metric-value" id="accuracy-value">{current_accuracy}</div>
         </div>
         """, unsafe_allow_html=True)
+    
+    st.markdown("""
+    <script>
+    // Listen for messages from the webcam component
+    window.addEventListener('message', function(event) {
+        if (event.data.type === 'webcam-frame') {
+            // Send to Streamlit
+            const frameData = event.data.data;
+            window.parent.Streamlit.setComponentValue(frameData);
+        }
+    });
+    </script>
+    """, unsafe_allow_html=True)
 
-if not st.session_state.is_analyzing and st.session_state.predictions:
+if st.session_state.results_ready and st.session_state.predictions:
     st.markdown("<div class='results-container'>", unsafe_allow_html=True)
     st.success("Analisis ekspresi wajah selesai!")
 
@@ -330,7 +355,6 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
         fig.patch.set_facecolor('#f4f4f7')
         ax.set_facecolor('#f4f4f7')
         
-        # Create x and y data from the predictions
         timestamps = st.session_state.prediction_timestamps
         expressions = [categories[idx] for idx in st.session_state.predictions]
         
@@ -384,6 +408,7 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
             st.session_state.current_expression = "-"
             st.session_state.current_accuracy = "-"
             st.session_state.video_started = False
+            st.session_state.last_frame = None
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -392,3 +417,39 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
         if st.button("Lanjut ke Analisis Teks", key='next_page_to_text_analysis'):
             st.switch_page("pages/2_jurnaling.py")
         st.markdown('</div>', unsafe_allow_html=True)
+
+if model_loaded:
+    frame_data = st.experimental_get_query_params().get('frame_data', [None])[0]
+    
+    if frame_data:
+        st.session_state.last_frame = frame_data
+        st.rerun()
+
+    st.markdown('<div class="custom-button-container">', unsafe_allow_html=True)
+    if st.button("Akhiri dan Lihat Hasil" if st.session_state.is_analyzing else "Mulai Analisis Baru"):
+        if not st.session_state.is_analyzing:
+            st.session_state.predictions = []
+            st.session_state.prediction_timestamps = []
+            st.session_state.start_time = time.time()
+            st.session_state.analysis_start_time = time.time()
+            st.session_state.is_analyzing = True
+            st.session_state.results_ready = False
+        else:
+            st.session_state.is_analyzing = False
+            st.session_state.results_ready = True
+            youtube_placeholder.markdown("""
+            <div class="youtube-container hidden" id="youtube-container">
+                <div class="youtube-embed">
+                    <iframe 
+                        width="640" 
+                        height="360" 
+                        src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=0&mute=1" 
+                        frameborder="0" 
+                        allowfullscreen
+                        id="youtube-iframe">
+                    </iframe>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
