@@ -10,7 +10,7 @@ from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfigura
 import gdown
 import os
 
-# Custom CSS (sama seperti kode asli Anda)
+# Custom CSS (tanpa styling untuk video karena tidak ditampilkan)
 st.markdown("""
 <style>
     .main { background-color: #0b0f2e; color: white; }
@@ -42,12 +42,6 @@ st.markdown("""
     .emotion-score { font-size: 24px; font-weight: bold; text-align: center; margin: 10px 0; }
     .negative-score { color: #ff6b6b; }
     .positive-score { color: #69db7c; }
-    .stApp .stImage {
-        display: flex;
-        justify-content: center;
-        align-items: center;
-        width: 100%;
-    }
     .youtube-container {
         display: flex;
         justify-content: center;
@@ -108,7 +102,7 @@ def calculate_emotion_scores(predictions):
     positive_score = (positive_count / total_predictions) * 100 if total_predictions > 0 else 0
     return negative_score, positive_score
 
-# Kelas untuk transformasi video WebRTC
+# Kelas untuk transformasi video WebRTC (tanpa menampilkan frame)
 class EmotionDetector(VideoTransformerBase):
     def __init__(self):
         self.model = model_effnet
@@ -135,14 +129,12 @@ class EmotionDetector(VideoTransformerBase):
             self.timestamps.append(current_time - self.start_time)
             self.last_capture_time = current_time
 
-            # Tampilkan emosi dan akurasi di frame
-            cv2.putText(img, f"{emotion} ({accuracy:.1f}%)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
             # Update placeholder metrik
             st.session_state.current_expression = emotion
             st.session_state.current_accuracy = f"{accuracy:.2f}%"
 
-        return img
+        # Kembalikan frame kosong agar tidak ditampilkan
+        return np.zeros_like(img)
 
 # Konfigurasi WebRTC
 RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
@@ -224,7 +216,7 @@ if start_stop_button:
         st.session_state.results_ready = True
     st.rerun()
 
-# Streaming webcam dengan WebRTC
+# Streaming webcam dengan WebRTC (tanpa tampilan)
 if model_loaded and st.session_state.is_analyzing:
     webrtc_ctx = webrtc_streamer(
         key="emotion-detection",
@@ -232,6 +224,7 @@ if model_loaded and st.session_state.is_analyzing:
         rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
+        video_html_attrs={"style": {"display": "none"}},  # Sembunyikan video dari UI
     )
 
     # Logika video YouTube
