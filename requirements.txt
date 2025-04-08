@@ -5,4 +5,5 @@ matplotlib==3.9.2
 numpy==1.26.2
 tensorflow==2.18.0
 streamlit==1.39.0
+streamlit-webrtc==0.60.2
 gdown==5.2.0
