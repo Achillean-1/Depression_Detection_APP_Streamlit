@@ -6,11 +6,11 @@ import matplotlib.pyplot as plt
 from collections import Counter
 from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.efficientnet import preprocess_input
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
 import gdown
 import os
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
-import av
 
+# Custom CSS (sama seperti kode asli Anda)
 st.markdown("""
 <style>
     .main { background-color: #0b0f2e; color: white; }
@@ -64,22 +64,19 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# Fungsi untuk memuat model
 @st.cache_resource
 def download_and_load_model():
     os.makedirs('model', exist_ok=True)
-    
     model_path = "model/Model_EfficientNet.keras"
-    
     if not os.path.exists(model_path):
         with st.spinner('Downloading model from Google Drive...'):
             file_id = '1yZfLsjnaXm_S8mUJ8uQkHbkVPLtNGwC0'
-            
             url = f'https://drive.google.com/uc?id={file_id}'
-            
             gdown.download(url, model_path, quiet=False)
-    
     return load_model(model_path)
 
+# Muat model
 try:
     with st.spinner('Loading model...'):
         model_effnet = download_and_load_model()
@@ -88,79 +85,72 @@ except Exception as e:
     st.error(f"Error loading model: {e}")
     model_loaded = False
 
+# Kategori emosi
 categories = ['Angry', 'Sad', 'Happy', 'Fearful', 'Disgust', 'Neutral', 'Surprised']
 positive_emotions = ['Happy', 'Surprised', 'Neutral']
 negative_emotions = ['Angry', 'Sad', 'Fearful', 'Disgust']
 
-# Frame interval for prediction (in seconds)
-FRAME_INTERVAL = 0.5
-
+# Fungsi prediksi ekspresi
 def predict_expression(image, model):
     image_resized = cv2.resize(image, (224, 224))
     image_array = np.expand_dims(image_resized, axis=0)
     image_array = preprocess_input(image_array)
-    
     pred = model.predict(image_array)
     return np.argmax(pred), pred
 
+# Hitung skor emosi
 def calculate_emotion_scores(predictions):
     emotion_indices = [categories[idx] for idx in predictions]
-
     total_predictions = len(predictions)
     negative_count = sum(1 for emotion in emotion_indices if emotion in negative_emotions)
     positive_count = sum(1 for emotion in emotion_indices if emotion in positive_emotions)
-    
     negative_score = (negative_count / total_predictions) * 100 if total_predictions > 0 else 0
     positive_score = (positive_count / total_predictions) * 100 if total_predictions > 0 else 0
-    
     return negative_score, positive_score
 
-# Video processor for WebRTC
-class EmotionProcessor(VideoProcessorBase):
-    def __init__(self, model):
-        self.model = model
-        self.predictions = []
-        self.prediction_timestamps = []
-        self.start_time = time.time()
+# Kelas untuk transformasi video WebRTC
+class EmotionDetector(VideoTransformerBase):
+    def __init__(self):
+        self.model = model_effnet
+        self.categories = categories
         self.last_capture_time = 0
-        
-    def recv(self, frame):
-        img = frame.to_ndarray(format="rgb24")
+        self.frame_interval = 0.5  # Interval prediksi 0.5 detik
+        self.predictions = st.session_state.predictions
+        self.timestamps = st.session_state.prediction_timestamps
+        self.start_time = st.session_state.start_time
+
+    def transform(self, frame):
+        img = frame.to_ndarray(format="bgr24")
         current_time = time.time()
-        elapsed_time = current_time - self.start_time
-        
-        # Proses frame untuk prediksi setiap interval tertentu
-        if current_time - self.last_capture_time >= FRAME_INTERVAL:
-            pred_idx, pred_prob = predict_expression(img, self.model)
-            
+
+        # Prediksi setiap 0.5 detik
+        if st.session_state.is_analyzing and (current_time - self.last_capture_time >= self.frame_interval):
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            pred_idx, pred_prob = predict_expression(img_rgb, self.model)
+            emotion = self.categories[pred_idx]
+            accuracy = pred_prob[0][pred_idx] * 100
+
+            # Simpan prediksi
             self.predictions.append(pred_idx)
-            self.prediction_timestamps.append(elapsed_time)
-            
-            # Perbarui status sesi
-            st.session_state.predictions = self.predictions
-            st.session_state.prediction_timestamps = self.prediction_timestamps
-            st.session_state.current_expression = categories[pred_idx]
-            st.session_state.current_accuracy = f"{pred_prob[0][pred_idx]*100:.2f}%"
-            
+            self.timestamps.append(current_time - self.start_time)
             self.last_capture_time = current_time
-        
-        return av.VideoFrame.from_ndarray(img, format="rgb24")
 
-# Initialize session state
-if 'predictions' not in st.session_state:
-    st.session_state.predictions = []
-    st.session_state.prediction_timestamps = []
-    st.session_state.is_analyzing = False
-    st.session_state.results_ready = False
-    st.session_state.current_expression = "-"
-    st.session_state.current_accuracy = "-"
-    st.session_state.video_started = False
-    st.session_state.analysis_start_time = None
-    st.session_state.last_capture_time = 0
-    st.session_state.webrtc_context = None
+            # Tampilkan emosi dan akurasi di frame
+            cv2.putText(img, f"{emotion} ({accuracy:.1f}%)", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
+            # Update placeholder metrik
+            st.session_state.current_expression = emotion
+            st.session_state.current_accuracy = f"{accuracy:.2f}%"
+
+        return img
+
+# Konfigurasi WebRTC
+RTC_CONFIGURATION = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+
+# Main app
 st.markdown("<h1>Analisis Emosi Wajah</h1>", unsafe_allow_html=True)
 
+# Placeholder untuk video YouTube
 youtube_placeholder = st.empty()
 youtube_placeholder.markdown("""
 <div class="youtube-container hidden" id="youtube-container">
@@ -177,24 +167,38 @@ youtube_placeholder.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# Inisialisasi session state
+if 'predictions' not in st.session_state:
+    st.session_state.predictions = []
+    st.session_state.prediction_timestamps = []
+    st.session_state.is_analyzing = False
+    st.session_state.results_ready = False
+    st.session_state.current_expression = "-"
+    st.session_state.current_accuracy = "-"
+    st.session_state.video_started = False
+    st.session_state.start_time = 0
+    st.session_state.analysis_start_time = None
+
+# UI untuk metrik
 col1, col2 = st.columns(2)
 expression_placeholder = col1.empty()
 accuracy_placeholder = col2.empty()
 
-expression_placeholder.markdown("""
+expression_placeholder.markdown(f"""
 <div class="metric-container">
     <div class="metric-label">Ekspresi Terdeteksi</div>
-    <div class="metric-value" id="expression-value">-</div>
+    <div class="metric-value">{st.session_state.current_expression}</div>
 </div>
 """, unsafe_allow_html=True)
 
-accuracy_placeholder.markdown("""
+accuracy_placeholder.markdown(f"""
 <div class="metric-container">
     <div class="metric-label">Akurasi</div>
-    <div class="metric-value" id="accuracy-value">-</div>
+    <div class="metric-value">{st.session_state.current_accuracy}</div>
 </div>
 """, unsafe_allow_html=True)
 
+# Tombol mulai/akhiri analisis
 button_col = st.columns([1, 2, 1])[1]
 with button_col:
     st.markdown('<div class="custom-button-container">', unsafe_allow_html=True)
@@ -204,61 +208,34 @@ with button_col:
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
+# Logika tombol
 if start_stop_button:
     st.session_state.is_analyzing = not st.session_state.is_analyzing
     if st.session_state.is_analyzing:
-        # Reset state for new analysis
         st.session_state.predictions = []
         st.session_state.prediction_timestamps = []
         st.session_state.start_time = time.time()
         st.session_state.analysis_start_time = time.time()
-        st.session_state.last_capture_time = 0
         st.session_state.results_ready = False
         st.session_state.current_expression = "-"
         st.session_state.current_accuracy = "-"
         st.session_state.video_started = False
     else:
-        # End analysis and show results
         st.session_state.results_ready = True
-        st.session_state.current_expression = "-"
-        st.session_state.current_accuracy = "-"
-        youtube_placeholder.markdown("""
-        <div class="youtube-container hidden" id="youtube-container">
-            <div class="youtube-embed">
-                <iframe 
-                    width="640" 
-                    height="360" 
-                    src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=0&mute=1" 
-                    frameborder="0" 
-                    allowfullscreen
-                    id="youtube-iframe">
-                </iframe>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
     st.rerun()
 
-# WebRTC Camera Stream for Emotion Analysis
+# Streaming webcam dengan WebRTC
 if model_loaded and st.session_state.is_analyzing:
-    # Configure RTC for WebRTC
-    rtc_configuration = RTCConfiguration(
-        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-    )
-    
-    # Display WebRTC streamer
     webrtc_ctx = webrtc_streamer(
         key="emotion-detection",
-        video_processor_factory=lambda: EmotionProcessor(model_effnet),
-        rtc_configuration=rtc_configuration,
+        video_transformer_factory=EmotionDetector,
+        rtc_configuration=RTC_CONFIGURATION,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
     )
-    
-    st.session_state.webrtc_context = webrtc_ctx
-    
-    # Update the UI with detection results
+
+    # Logika video YouTube
     if webrtc_ctx.state.playing:
-        # Check if video should start
         current_time = time.time()
         if not st.session_state.video_started and (current_time - st.session_state.analysis_start_time) >= 10:
             youtube_placeholder.markdown("""
@@ -274,47 +251,18 @@ if model_loaded and st.session_state.is_analyzing:
                     </iframe>
                 </div>
             </div>
-            <script>
-                // JavaScript to ensure video starts
-                document.getElementById('youtube-iframe').src = 
-                    "https://www.youtube.com/embed/3XA0bB79oGc?autoplay=1&mute=1";
-            </script>
             """, unsafe_allow_html=True)
             st.session_state.video_started = True
-        
-        # Create a container for showing live metrics
-        status_container = st.container()
-        
-        # Use empty placeholders to update metrics
-        with status_container:
-            while st.session_state.is_analyzing:
-                expression_placeholder.markdown(f"""
-                <div class="metric-container">
-                    <div class="metric-label">Ekspresi Terdeteksi</div>
-                    <div class="metric-value" id="expression-value">{st.session_state.current_expression}</div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                accuracy_placeholder.markdown(f"""
-                <div class="metric-container">
-                    <div class="metric-label">Akurasi</div>
-                    <div class="metric-value" id="accuracy-value">{st.session_state.current_accuracy}</div>
-                </div>
-                """, unsafe_allow_html=True)
-                
-                # Add delay to reduce UI updates
-                time.sleep(0.5)
 
-# Display results after analysis is complete
+# Tampilkan hasil setelah analisis selesai
 if not st.session_state.is_analyzing and st.session_state.predictions:
     st.markdown("<div class='results-container'>", unsafe_allow_html=True)
     st.success("Analisis ekspresi wajah selesai!")
 
     negative_score, positive_score = calculate_emotion_scores(st.session_state.predictions)
-    
     st.session_state.negative_score = negative_score
     st.session_state.positive_score = positive_score
-    
+
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"""
@@ -323,7 +271,6 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
             <div class="emotion-score negative-score">{negative_score:.1f}%</div>
         </div>
         """, unsafe_allow_html=True)
-    
     with col2:
         st.markdown(f"""
         <div class="metric-container positive-score">
@@ -345,11 +292,8 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
         fig, ax = plt.subplots(figsize=(10, 6))
         fig.patch.set_facecolor('#f4f4f7')
         ax.set_facecolor('#f4f4f7')
-        
-        # Create x and y data from the predictions
         timestamps = st.session_state.prediction_timestamps
         expressions = [categories[idx] for idx in st.session_state.predictions]
-        
         ax.plot(timestamps, expressions, marker='o', linestyle='-', color='#3a7aff')
         ax.set_xlabel("Waktu (detik)", color='#111c4e')
         ax.set_ylabel("Ekspresi", color='#111c4e')
@@ -373,7 +317,6 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
                 from_emotion = categories[st.session_state.predictions[i-1]]
                 to_emotion = categories[st.session_state.predictions[i]]
                 change_times.append((from_emotion, to_emotion, change_time))
-        
         if change_times:
             change_times = sorted(change_times, key=lambda x: x[2])[:3]
             st.write("**3 Perubahan Ekspresi Tercepat:**")
@@ -389,7 +332,6 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
     st.markdown("</div>", unsafe_allow_html=True)
 
     col1, col2 = st.columns([1, 1])
-
     with col1:
         st.markdown('<div class="custom-button-container">', unsafe_allow_html=True)
         if st.button("Reset Analisis", key='reset_analysis_button'):
@@ -402,7 +344,6 @@ if not st.session_state.is_analyzing and st.session_state.predictions:
             st.session_state.video_started = False
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
-
     with col2:
         st.markdown('<div class="custom-button-container">', unsafe_allow_html=True)
         if st.button("Lanjut ke Analisis Teks", key='next_page_to_text_analysis'):
