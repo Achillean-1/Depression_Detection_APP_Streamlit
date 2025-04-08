@@ -1,4 +1,5 @@
 import streamlit as st
+import cv2
 import numpy as np
 import time
 import matplotlib.pyplot as plt
@@ -7,33 +8,8 @@ from tensorflow.keras.models import load_model
 from tensorflow.keras.applications.efficientnet import preprocess_input
 import gdown
 import os
-import base64
-from PIL import Image
-import io
-import cv2
-
-# Initialize session state
-if 'predictions' not in st.session_state:
-    st.session_state.predictions = []
-    st.session_state.prediction_timestamps = []
-    st.session_state.is_analyzing = False
-    st.session_state.results_ready = False
-    st.session_state.current_expression = "-"
-    st.session_state.current_accuracy = "-"
-    st.session_state.video_started = False
-    st.session_state.analysis_start_time = None
-    st.session_state.last_capture_time = 0
-    st.session_state.current_frame = None
-    st.session_state.webcam_running = False
-    st.session_state.start_time = time.time()
-
-# Create a callback for receiving webcam frames
-def handle_webcam_frame(image_data):
-    if st.session_state.is_analyzing and image_data is not None:
-        st.session_state.current_frame = image_data
-        # Set a flag to trigger rerun
-        st.session_state.webcam_update = True
-        st.rerun()
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
 
 st.markdown("""
 <style>
@@ -116,6 +92,9 @@ categories = ['Angry', 'Sad', 'Happy', 'Fearful', 'Disgust', 'Neutral', 'Surpris
 positive_emotions = ['Happy', 'Surprised', 'Neutral']
 negative_emotions = ['Angry', 'Sad', 'Fearful', 'Disgust']
 
+# Frame interval for prediction (in seconds)
+FRAME_INTERVAL = 0.5
+
 def predict_expression(image, model):
     image_resized = cv2.resize(image, (224, 224))
     image_array = np.expand_dims(image_resized, axis=0)
@@ -136,39 +115,49 @@ def calculate_emotion_scores(predictions):
     
     return negative_score, positive_score
 
-# Process base64 image from webcam
-def process_webcam_frame(base64_image):
-    try:
-        # Remove data URL prefix
-        if "," in base64_image:
-            base64_image = base64_image.split(",")[1]
+# Video processor for WebRTC
+class EmotionProcessor(VideoProcessorBase):
+    def __init__(self, model):
+        self.model = model
+        self.predictions = []
+        self.prediction_timestamps = []
+        self.start_time = time.time()
+        self.last_capture_time = 0
         
-        # Decode base64 image
-        image_bytes = base64.b64decode(base64_image)
-        image = Image.open(io.BytesIO(image_bytes))
+    def recv(self, frame):
+        img = frame.to_ndarray(format="rgb24")
+        current_time = time.time()
+        elapsed_time = current_time - self.start_time
         
-        # Convert to RGB numpy array
-        frame_rgb = np.array(image)
+        # Proses frame untuk prediksi setiap interval tertentu
+        if current_time - self.last_capture_time >= FRAME_INTERVAL:
+            pred_idx, pred_prob = predict_expression(img, self.model)
+            
+            self.predictions.append(pred_idx)
+            self.prediction_timestamps.append(elapsed_time)
+            
+            # Perbarui status sesi
+            st.session_state.predictions = self.predictions
+            st.session_state.prediction_timestamps = self.prediction_timestamps
+            st.session_state.current_expression = categories[pred_idx]
+            st.session_state.current_accuracy = f"{pred_prob[0][pred_idx]*100:.2f}%"
+            
+            self.last_capture_time = current_time
         
-        # Predict expression
-        if model_loaded:
-            pred_idx, pred_prob = predict_expression(frame_rgb, model_effnet)
-            
-            current_time = time.time()
-            elapsed_time = current_time - st.session_state.start_time
-            
-            st.session_state.predictions.append(pred_idx)
-            st.session_state.prediction_timestamps.append(elapsed_time)
-            
-            current_expression = categories[pred_idx]
-            current_accuracy = f"{pred_prob[0][pred_idx]*100:.2f}%"
-            
-            return frame_rgb, current_expression, current_accuracy
-        
-        return frame_rgb, "Model not loaded", "0%"
-    except Exception as e:
-        st.error(f"Error processing webcam frame: {e}")
-        return None, "Error", "0%"
+        return av.VideoFrame.from_ndarray(img, format="rgb24")
+
+# Initialize session state
+if 'predictions' not in st.session_state:
+    st.session_state.predictions = []
+    st.session_state.prediction_timestamps = []
+    st.session_state.is_analyzing = False
+    st.session_state.results_ready = False
+    st.session_state.current_expression = "-"
+    st.session_state.current_accuracy = "-"
+    st.session_state.video_started = False
+    st.session_state.analysis_start_time = None
+    st.session_state.last_capture_time = 0
+    st.session_state.webrtc_context = None
 
 st.markdown("<h1>Analisis Emosi Wajah</h1>", unsafe_allow_html=True)
 
@@ -188,7 +177,6 @@ youtube_placeholder.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Create columns for metrics
 col1, col2 = st.columns(2)
 expression_placeholder = col1.empty()
 accuracy_placeholder = col2.empty()
@@ -207,171 +195,118 @@ accuracy_placeholder.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Create container for webcam display
-frame_placeholder = st.empty()
-
-# Custom webcam component using streamlit-webrtc
-if model_loaded:
-    # Create a custom HTML component for webcam access
-    webcam_html = """
-    <div style="display: flex; flex-direction: column; align-items: center;">
-        <video id="webcam" autoplay playsinline style="width: 640px; height: 480px; border-radius: 10px;"></video>
-        <canvas id="canvas" width="640" height="480" style="display: none;"></canvas>
-    </div>
-    <script>
-        const video = document.getElementById('webcam');
-        const canvas = document.getElementById('canvas');
-        const ctx = canvas.getContext('2d');
-        let stream = null;
-        let captureInterval = null;
-        let isCapturing = false;
-
-        // Function to initialize webcam
-        async function setupWebcam() {
-            try {
-                stream = await navigator.mediaDevices.getUserMedia({
-                    video: { width: 640, height: 480 },
-                    audio: false
-                });
-                video.srcObject = stream;
-                return true;
-            } catch (err) {
-                console.error("Error accessing webcam:", err);
-                return false;
-            }
-        }
-
-        // Function to capture frame
-        function captureFrame() {
-            if (!stream) return;
-            
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            const imageData = canvas.toDataURL('image/jpeg', 0.8);
-            
-            // Send to Streamlit using the Streamlit component callback
-            if (window.parent && window.parent.Streamlit) {
-                window.parent.Streamlit.setComponentValue(imageData);
-            }
-        }
-
-        // Setup webcam and start capturing when component loads
-        setupWebcam().then(success => {
-            if (success) {
-                isCapturing = true;
-                captureInterval = setInterval(captureFrame, 500); // Capture every 500ms
-            }
-        });
-
-        // Clean up when component is unmounted
-        window.addEventListener('beforeunload', () => {
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
-            }
-            if (captureInterval) {
-                clearInterval(captureInterval);
-            }
-        });
-    </script>
-    """
-    
-    # Display the webcam component if analyzing
-    if st.session_state.is_analyzing:
-        frame_component = st.components.v1.html(webcam_html, height=500, key="webcam_component")
-        st.session_state.webcam_running = True
-    else:
-        # Display a placeholder when not analyzing
-        if not st.session_state.results_ready:
-            frame_placeholder.markdown("""
-            <div style="display: flex; justify-content: center; align-items: center; 
-                        width: 640px; height: 480px; background-color: #111c4e; 
-                        border-radius: 10px; margin: 0 auto;">
-                <p style="color: white; font-size: 16px;">Kamera tidak aktif</p>
-            </div>
-            """, unsafe_allow_html=True)
-
-# Start/Stop Analysis Button
 button_col = st.columns([1, 2, 1])[1]
 with button_col:
     st.markdown('<div class="custom-button-container">', unsafe_allow_html=True)
-    if st.button('Mulai Analisis' if not st.session_state.is_analyzing else 'Akhiri Analisis'):
-        if not st.session_state.is_analyzing:
-            # Start new analysis
-            st.session_state.predictions = []
-            st.session_state.prediction_timestamps = []
-            st.session_state.start_time = time.time()
-            st.session_state.analysis_start_time = time.time()
-            st.session_state.last_capture_time = 0
-            st.session_state.results_ready = False
-            st.session_state.current_expression = "-"
-            st.session_state.current_accuracy = "-"
-            st.session_state.video_started = False
-            st.session_state.is_analyzing = True
-            
-            # Show stimulus video after delay
-            if not st.session_state.video_started and (time.time() - st.session_state.analysis_start_time) >= 10:
-                youtube_placeholder.markdown("""
-                <div class="youtube-container" id="youtube-container">
-                    <div class="youtube-embed">
-                        <iframe 
-                            width="640" 
-                            height="360" 
-                            src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=1&mute=1" 
-                            frameborder="0" 
-                            allowfullscreen
-                            id="youtube-iframe">
-                        </iframe>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-                st.session_state.video_started = True
-        else:
-            # End analysis and show results
-            st.session_state.is_analyzing = False
-            st.session_state.results_ready = True
-            st.session_state.webcam_running = False
+    start_stop_button = st.button(
+        'Mulai Analisis' if not st.session_state.is_analyzing else 'Akhiri Analisis',
+        key='start_stop_analysis_button'
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+if start_stop_button:
+    st.session_state.is_analyzing = not st.session_state.is_analyzing
+    if st.session_state.is_analyzing:
+        # Reset state for new analysis
+        st.session_state.predictions = []
+        st.session_state.prediction_timestamps = []
+        st.session_state.start_time = time.time()
+        st.session_state.analysis_start_time = time.time()
+        st.session_state.last_capture_time = 0
+        st.session_state.results_ready = False
+        st.session_state.current_expression = "-"
+        st.session_state.current_accuracy = "-"
+        st.session_state.video_started = False
+    else:
+        # End analysis and show results
+        st.session_state.results_ready = True
+        st.session_state.current_expression = "-"
+        st.session_state.current_accuracy = "-"
+        youtube_placeholder.markdown("""
+        <div class="youtube-container hidden" id="youtube-container">
+            <div class="youtube-embed">
+                <iframe 
+                    width="640" 
+                    height="360" 
+                    src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=0&mute=1" 
+                    frameborder="0" 
+                    allowfullscreen
+                    id="youtube-iframe">
+                </iframe>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    st.rerun()
+
+# WebRTC Camera Stream for Emotion Analysis
+if model_loaded and st.session_state.is_analyzing:
+    # Configure RTC for WebRTC
+    rtc_configuration = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+    
+    # Display WebRTC streamer
+    webrtc_ctx = webrtc_streamer(
+        key="emotion-detection",
+        video_processor_factory=lambda: EmotionProcessor(model_effnet),
+        rtc_configuration=rtc_configuration,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
+    
+    st.session_state.webrtc_context = webrtc_ctx
+    
+    # Update the UI with detection results
+    if webrtc_ctx.state.playing:
+        # Check if video should start
+        current_time = time.time()
+        if not st.session_state.video_started and (current_time - st.session_state.analysis_start_time) >= 10:
             youtube_placeholder.markdown("""
-            <div class="youtube-container hidden" id="youtube-container">
+            <div class="youtube-container" id="youtube-container">
                 <div class="youtube-embed">
                     <iframe 
                         width="640" 
                         height="360" 
-                        src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=0&mute=1" 
+                        src="https://www.youtube.com/embed/3XA0bB79oGc?autoplay=1&mute=1" 
                         frameborder="0" 
                         allowfullscreen
                         id="youtube-iframe">
                     </iframe>
                 </div>
             </div>
+            <script>
+                // JavaScript to ensure video starts
+                document.getElementById('youtube-iframe').src = 
+                    "https://www.youtube.com/embed/3XA0bB79oGc?autoplay=1&mute=1";
+            </script>
             """, unsafe_allow_html=True)
-        st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
+            st.session_state.video_started = True
+        
+        # Create a container for showing live metrics
+        status_container = st.container()
+        
+        # Use empty placeholders to update metrics
+        with status_container:
+            while st.session_state.is_analyzing:
+                expression_placeholder.markdown(f"""
+                <div class="metric-container">
+                    <div class="metric-label">Ekspresi Terdeteksi</div>
+                    <div class="metric-value" id="expression-value">{st.session_state.current_expression}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                accuracy_placeholder.markdown(f"""
+                <div class="metric-container">
+                    <div class="metric-label">Akurasi</div>
+                    <div class="metric-value" id="accuracy-value">{st.session_state.current_accuracy}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Add delay to reduce UI updates
+                time.sleep(0.5)
 
-# Process webcam frame if available
-if 'current_frame' in st.session_state and st.session_state.current_frame is not None and st.session_state.is_analyzing:
-    frame_rgb, current_expression, current_accuracy = process_webcam_frame(st.session_state.current_frame)
-    
-    if frame_rgb is not None:
-        frame_placeholder.image(frame_rgb, channels="RGB")
-        
-        expression_placeholder.markdown(f"""
-        <div class="metric-container">
-            <div class="metric-label">Ekspresi Terdeteksi</div>
-            <div class="metric-value" id="expression-value">{current_expression}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        accuracy_placeholder.markdown(f"""
-        <div class="metric-container">
-            <div class="metric-label">Akurasi</div>
-            <div class="metric-value" id="accuracy-value">{current_accuracy}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Reset the flag
-        st.session_state.current_frame = None
-
-# Display results
-if st.session_state.results_ready and st.session_state.predictions:
+# Display results after analysis is complete
+if not st.session_state.is_analyzing and st.session_state.predictions:
     st.markdown("<div class='results-container'>", unsafe_allow_html=True)
     st.success("Analisis ekspresi wajah selesai!")
 
